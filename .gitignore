@@ -1,0 +1,15 @@
+Base de Datos/
+checkpoints
+logs
+*.png
+*.jpg
+*.jpeg
+*.tsv
+Data/*
+*.docx
+*.bin
+*.txt
+*.pyc
+*.pdf
+*pptx
+*zip
