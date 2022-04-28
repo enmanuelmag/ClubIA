@@ -29,96 +29,14 @@ class ReleaseMemory(tf.keras.callbacks.Callback):
     k.clear_session()
 
 
-class AddPositionEmbs(layers.Layer):
-  """
-  Inputs are image patches Custom layer to add positional embeddings to the inputs.
-  tf.keras.initializers.RandomNormal(stddev=0.02)
-  """
-  def __init__(self, posemb_init=None, **kwargs):
-    super(AddPositionEmbs, self).__init__(**kwargs)
-    self.posemb_init = posemb_init
-    #posemb_init=tf.keras.initializers.RandomNormal(stddev=0.02), name='posembed_input') # used in original code
-
-  def build(self, inputs_shape):
-    pos_emb_shape = (1, inputs_shape[1], inputs_shape[2])
-    self.pos_embedding = self.add_weight('pos_embedding', pos_emb_shape, initializer=self.posemb_init)
-
-  def call(self, inputs, inputs_positions=None):
-    # inputs.shape is (batch_size, seq_len, emb_dim).
-    pos_embedding = tf.cast(self.pos_embedding, inputs.dtype)
-    return inputs + pos_embedding
-
-def mlp_block_f(mlp_dim, inputs):
-  x = layers.Dense(units=mlp_dim, activation=tf.nn.gelu)(inputs)
-  x = layers.Dropout(0.1)(x) # dropout rate is from original paper,
-  x = layers.Dense(units=inputs.shape[-1], activation=tf.nn.gelu)(x) # check GELU paper
-  x = layers.Dropout(0.1)(x)
-  return x
-
-def EncoderBlock(inputs, num_heads, mlp_dim):
-  x = layers.LayerNormalization(dtype=inputs.dtype)(inputs)
-  x = layers.MultiHeadAttention(num_heads=num_heads, key_dim=inputs.shape[-1], dropout=0.1)(x, x) 
-  # self attention multi-head, dropout_rate is from original implementation
-  x = layers.Add()([x, inputs]) # 1st residual part 
-  
-  y = layers.LayerNormalization(dtype=x.dtype)(x)
-  y = mlp_block_f(mlp_dim, y)
-  y_1 = layers.Add()([y, x]) #2nd residual part 
-  return y_1
-
-def Encoder(inputs, num_layers, mlp_dim, num_heads):
-  x = AddPositionEmbs(posemb_init=tf.keras.initializers.RandomNormal(stddev=0.02), name='posembed_input')(inputs)
-  x = layers.Dropout(0.2)(x)
-  for _ in range(num_layers):
-    x = EncoderBlock(x, num_heads, mlp_dim)
-
-  encoded = layers.LayerNormalization(name='EncoderNorm')(x)
-  return encoded
-
-def generate_patch_conv_orgPaper_f(inputs, patch_size, hidden_size):
-  patches = tf.keras.layers.Conv2D(
-    filters=hidden_size,
-    kernel_size=patch_size,
-    strides=patch_size, #the stride is the same as the patch (piece) size
-    padding='valid'
-  )(inputs)
-  row_axis, col_axis = (1, 2) # channels last images
-  seq_len = (inputs.shape[row_axis] // patch_size) * (inputs.shape[col_axis] // patch_size)
-  x = tf.reshape(patches, [-1, seq_len, hidden_size])
-  return x
-
-def ViTModel(class_types, transformer_layers, patch_size, hidden_size, num_heads, mlp_dim, shape=(224, 224, 3)):
-  rescale_layer = tf.keras.Sequential([layers.Rescaling(1./255)])
-  inputs = layers.Input(shape=shape)
-  
-  rescale = rescale_layer(inputs) # rescaling (normalizing pixel val between 0 and 1)
- 
-  patches = generate_patch_conv_orgPaper_f(rescale, patch_size, hidden_size) # generate patches with conv layer
-
-  encoder_out = Encoder(patches, transformer_layers, mlp_dim, num_heads) # ready for the transformer blocks
-
-  #  final part (mlp to classification)
-  im_representation = tf.reduce_mean(encoder_out, axis=1)  # (1,) or (1,2)
-
-  logits = layers.Dense(
-    units=class_types,
-    name='Head',
-    kernel_initializer=tf.keras.initializers.zeros
-  )(im_representation) # !!! important !!! activation is linear 
-  return tf.keras.Model(inputs=inputs, outputs=logits)
-
-
-
-class AnimeClassifier(tf.keras.Model):
+class ViClassifier(tf.keras.Model):
   def __init__(self, num_classes, input_shape, units=1024, inner_layers=12, type_extractor='vgg'):
-    print(num_classes, input_shape, units, inner_layers, type_extractor)
     assert type_extractor in ['vgg', 'inception', 'resnet']
     assert inner_layers >= 1
-    assert num_classes >= 2
     assert len(input_shape) == 3
     assert units >= 64
 
-    super(AnimeClassifier, self).__init__(name='AnimeClassifier')
+    super(ViClassifier, self).__init__(name='ViClassifier')
 
     self.units = units
     self.in_layer = tf.keras.layers.Input(input_shape, name='input')
@@ -188,6 +106,7 @@ def parse_record_vec(combination):
   img_2, label_2 = item_2
   return (img_1, img_2, label_1 == label_2)
 
+
 def process_image_tf(image, size):
   print('Image byte', image)
   #image = tf.io.read_file(image_path)
@@ -197,39 +116,3 @@ def process_image_tf(image, size):
   image = tf.image.resize(image, (size, size))
   return preprocess_input(image, mode='tf')
 
-
-
-
-
-
-class GeneratePatch(tf.keras.layers.Layer):
-  def __init__(self, patch_size):
-    super(GeneratePatch, self).__init__(name='GeneratePatch')
-    self.patch_size = patch_size
-
-  def call(self, images):
-    batch_size = tf.shape(images)[0]
-    patches = tf.image.extract_patches(
-      images=images, 
-      sizes=[1, self.patch_size, self.patch_size, 1], 
-      strides=[1, self.patch_size, self.patch_size, 1], rates=[1, 1, 1, 1], padding="VALID"
-    )
-    patch_dims = patches.shape[-1]
-    patches = tf.reshape(patches, [batch_size, -1, patch_dims]) #here shape is (batch_size, num_patches, patch_h*patch_w*c) 
-    return patches
-
-class PatchEncodeEmbed(layers.Layer):
-  """
-  Positional Encoding Layer, 2 steps happen here
-    1. Flatten the patches
-    2. Map to dim D; patch embeddings
-  """
-  def __init__(self, num_patches, projection_dim):
-    super(PatchEncodeEmbed, self).__init__()
-    self.num_patches = num_patches
-    self.projection = layers.Dense(units=projection_dim)
-    self.position_embedding = layers.Embedding(input_dim=num_patches, output_dim=projection_dim)
-
-  def call(self, patch):
-    positions = tf.range(start=0, limit=self.num_patches, delta=1)
-    return self.projection(patch) + self.position_embedding(positions)
